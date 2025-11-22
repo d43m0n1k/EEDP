@@ -1,0 +1,650 @@
+# ============================
+# PANL to EXO Custom Attribute Sync Script
+# Supports matching by Company, Department, or Both
+# Supports automatic DDL Creation and Updating
+# ============================
+
+# Welcome
+Write-Host "Welcome to Blake's Entra to EXO and DDL Population Script." -ForegroundColor Blue
+
+# =============================
+# Admin Detection
+# =============================
+$IsAdmin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent() `
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $IsAdmin) {
+    Write-Host "This script must be run in an elevated PowerShell (Run as Administrator)." -ForegroundColor Red
+    Write-Host "Right-click PowerShell to Run as Administrator, then try again." -ForegroundColor Yellow
+    exit
+}
+
+# Connect to GraphAPI
+Write-Host "We will need to connect to Microsoft GraphAPI."
+Write-Host "A sign-in window may appear. Complete login, then press ENTER to continue..."
+Connect-MgGraph -Scopes "User.Read.All","Directory.Read.All","CustomSecAttributeAssignment.Read.All"
+Read-Host "Press ENTER once you have successfully signed in"
+
+# Connect to EXO:
+Write-Host "We will need to connect to Exchange Online."
+Write-Host "Connecting to EXO... a login window may appear."
+Connect-ExchangeOnline
+Read-Host "Press ENTER once EXO sign-in is complete"
+
+# ============================
+# Prompt for user match method
+# ============================
+
+$matchTypeRaw = Read-Host "Pull users by Company Name (C), Department (D), or Both (B)? Enter C/D/B"
+
+# Normalize user input
+$matchType = $matchTypeRaw.Trim().ToUpper()
+
+# Validate after normalization
+if ($matchType -notin @("C","D","B")) {
+    Write-Host "Invalid selection. Exiting script." -ForegroundColor Red
+    exit
+}
+
+# Use $matchType directly going forward
+Write-Host "Selection accepted: $matchType"
+
+switch ($matchType) {
+    "C" {
+        $company = Read-Host "Enter the Company Name exactly as it appears in Azure/Graph"
+        if (-not $company) { Write-Host "Company cannot be empty. Exiting." -ForegroundColor Red; exit }
+        Write-Host "Selected: Company Name = '$company'" -ForegroundColor Green
+    }
+    "D" {
+        $dept = Read-Host "Enter the Department exactly as it appears in Azure/Graph"
+        if (-not $dept) { Write-Host "Department cannot be empty. Exiting." -ForegroundColor Red; exit }
+        Write-Host "Selected: Department = '$dept'" -ForegroundColor Green
+    }
+    "B" {
+        $company = Read-Host "Enter the Company Name"
+        $dept    = Read-Host "Enter the Department"
+        if (-not $company -or -not $dept) {
+            Write-Host "Company and Department cannot be empty in Both mode. Exiting." -ForegroundColor Red
+            exit
+        }
+        Write-Host "Selected: Company '$company' AND Department '$dept'" -ForegroundColor Green
+    }
+}
+
+# Build safe CSV name based on selection
+if ($matchType -eq 'C') {
+    $safeName = ($company -replace '[\\/:*?"<>|]', '') -replace '\s+', ''
+}
+elseif ($matchType -eq 'D') {
+    $safeName = ($dept -replace '[\\/:*?"<>|]', '') -replace '\s+', ''
+}
+else {
+    $both = "$company-$dept"
+    $safeName = ($both -replace '[\\/:*?"<>|]', '') -replace '\s+', ''
+}
+
+$exportFolder = "C:\ScriptReturns"
+$csvPath      = Join-Path $exportFolder "PANL-$safeName.csv"
+
+# Label used in spinner + final message
+switch ($matchType) {
+    "C" { $scopeLabel = "Company: $company" }
+    "D" { $scopeLabel = "Dept: $dept" }
+    "B" { $scopeLabel = "Company: $company | Dept: $dept" }
+}
+
+# Ensure export folder exists
+Write-Host "Ensuring export folder exists."
+if (-not (Test-Path $exportFolder)) {
+    New-Item -ItemType Directory -Path $exportFolder -Force | Out-Null
+}
+
+# ============================
+# Pull Memberlist from GraphAPI
+# ============================
+
+Write-Host "Querying GraphAPI for user data. This may take a few minutes depending on total users found."
+
+# Base Graph URL - no server-side filter; we filter client-side on company/dept
+$url  = "https://graph.microsoft.com/v1.0/users?`$select=id,displayName,userPrincipalName,companyName,department,customSecurityAttributes,employeeType,accountEnabled,jobTitle&`$top=999"
+$rows = @()
+$page = 0
+
+# Simple "Loading" spinner to prevent users from thinking the script crashed
+$spinner   = @("Loading   ", "Loading.  ", "Loading.. ", "Loading...")
+$spinIndex = 0
+
+Write-Host ""  # blank line so we don't overwrite the prompt
+
+while ($url) {
+    $page++
+
+    # Update spinner text each loop
+    $spinIndex = ($spinIndex + 1) % $spinner.Count
+    $text      = "{0} ({1}, Page {2})" -f $spinner[$spinIndex], $scopeLabel, $page
+
+    # `r = carriage return: go back to start of the same line
+    Write-Host "`r$text" -NoNewline
+
+    $p = Invoke-MgGraphRequest -Method GET -Uri $url
+
+    foreach ($u in $p.value) {
+        # -------------------------
+        # APPLY USER FILTER
+        # -------------------------
+        $includeUser = $false
+
+        switch ($matchType) {
+
+            "C" {
+                if ($u.companyName -eq $company) { $includeUser = $true }
+            }
+
+            "D" {
+                if ($u.department -eq $dept) { $includeUser = $true }
+            }
+
+            "B" {
+                if ($u.companyName -eq $company -and $u.department -eq $dept) {
+                    $includeUser = $true
+                }
+            }
+        }
+
+        if (-not $includeUser) { continue }
+
+        $panl = $u.customSecurityAttributes.PANLCustomUserAttributes
+
+        # --- Fallback merge logic ---
+
+        # Start with PANL values if present
+        $userType = $null
+        $status   = $null
+        $role     = $null
+
+        if ($panl) {
+            $userType = $panl.UserType
+            $status   = $panl.Status
+            $role     = $panl.Role
+        }
+
+        # If PANL UserType is missing/blank, fall back to Entra employeeType
+        if ([string]::IsNullOrWhiteSpace($userType)) {
+            $empTypeRaw = [string]$u.employeeType
+            $empType    = $empTypeRaw.Trim()
+
+            if ($empType -ieq "Employee") {
+                # Convert Azure "Employee" to our "Staff"
+                $userType = "Staff"
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($empType)) {
+                # Anything else (Contractor, Systems Account, Service Account, etc.)
+                # stays as-is from Entra
+                $userType = $empType
+            }
+            else {
+                # Truly blank -> default to Staff
+                $userType = "Staff"
+            }
+        }
+
+        # If PANL Status is missing/blank, fall back to Entra accountEnabled
+        if ([string]::IsNullOrWhiteSpace($status)) {
+            if ($null -ne $u.accountEnabled) {
+                # Map accountEnabled $true/$false into Status
+                $status = if ($u.accountEnabled -eq $true) { "Active" } else { "Terminated" }
+            }
+        }
+
+        # If PANL Role is missing/blank, fall back to Entra jobTitle
+        if ([string]::IsNullOrWhiteSpace($role)) {
+            $role = $u.jobTitle
+        }
+
+        # --- Build output object ---
+
+    $rows += [pscustomobject]@{
+        DisplayName  = $u.displayName
+        UPN          = $u.userPrincipalName
+        Company      = $u.companyName
+        Department   = $u.department
+
+        # These already merge PANL + Entra logic
+        UserType     = $userType       # PANL.UserType or mapped employeeType
+        Status       = $status         # PANL.Status or mapped from accountEnabled
+        Role         = $role           # PANL.Role or jobTitle
+
+        # The rest still come straight from PANL if present (or $null if not)
+        AccountType  = $panl.AccountType
+        Division     = $panl.Division
+        Remote       = $panl.Remote
+        AdminAccount = $panl.HasAdministratorAccount
+            }
+        }
+        
+   $url = $p.'@odata.nextLink'
+
+    }
+
+# Finish the spinner line with a newline + final message
+Write-Host "`rDone loading users for $scopeLabel.`n"
+
+Write-Host "Exporting $($rows.Count) rows to CSV..."
+$rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+Write-Host "Export complete: $csvPath"
+
+# ============================================
+# Extract Company/Dept from CSV for DDL usage
+# ============================================
+
+$csvData = Import-Csv -Path $csvPath
+
+# Auto-detect company if missing
+if (-not $company -or $company.Trim() -eq "") {
+    $company = ($csvData.Company | Sort-Object -Unique | Where-Object { $_ -and $_.Trim() -ne "" }) | Select-Object -First 1
+    Write-Host "Auto-detected Company from CSV: $company" -ForegroundColor Yellow
+}
+
+# Auto-detect dept if missing (may legitimately be blank)
+if (-not $dept -or $dept.Trim() -eq "") {
+    $dept = ($csvData.Department | Sort-Object -Unique | Where-Object { $_ -and $_.Trim() -ne "" }) | Select-Object -First 1
+
+    if ($dept) {
+        Write-Host "Auto-detected Department from CSV: $dept" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "No Department detected - DDL filters will use Company only." -ForegroundColor DarkYellow
+    }
+}
+
+# Save flags for DDL creation
+$ddlCompany = $company
+$ddlDept    = $dept
+$ddlUseDept = $true
+
+if (-not $ddlDept -or $ddlDept.Trim() -eq "") {
+    # All users have no department OR were pulled only by Company
+    $ddlUseDept = $false
+}
+
+# ============================
+# EXO write-back section
+# ============================
+
+# Ask whether to write to EXO, skip, or dry run
+$exoActionRaw = Read-Host "Members for $scopeLabel have been exported to $csvPath. Write values to EXO now? (Y = Yes, N = No, D = Dry Run)"
+$exoAction = $exoActionRaw.Trim().ToUpper()
+
+if ($exoAction -notin @("Y","N","D")) {
+    Write-Host "Invalid selection. Exiting without EXO changes. CSV is available at $csvPath" -ForegroundColor Yellow
+    return
+}
+
+if ($exoAction -eq 'N') {
+    Write-Host "Skipping EXO write-back as requested. CSV is available at $csvPath" -ForegroundColor Yellow
+    return
+}
+
+# Log file for fallback cases (used only if we actually write to EXO)
+$fallbackLog = "C:\ScriptReturns\PANL-Fallbacks.log"
+
+# Ensure log file exists
+if (-not (Test-Path $fallbackLog)) {
+    New-Item -ItemType File -Path $fallbackLog -Force | Out-Null
+}
+
+# Helper: used ONLY when Set-Mailbox by UPN is ambiguous or missing
+function Resolve-AmbiguousMailboxAndSetAttributes {
+    param(
+        [string]$Upn,
+        [string]$Ca1,
+        [string]$Ca2,
+        [string]$Ca3
+    )
+
+    Write-Warning "[$Upn] Ambiguous identity, resolving with Get-Mailbox..."
+
+    $mbx = Get-Mailbox -ResultSize Unlimited -Filter "UserPrincipalName -eq '$Upn'"
+
+    if (-not $mbx) {
+        Write-Warning "[$Upn] No mailbox found during ambiguity resolution, skipping."
+        Add-Content -Path $fallbackLog -Value ("{0} | {1} | NO MAILBOX FOUND (Resolve-Ambiguous)" -f (Get-Date), $Upn)
+        return
+    }
+
+    if ($mbx.Count -gt 1) {
+        Write-Warning "[$Upn] Multiple mailboxes found even after resolution, skipping."
+        $mbx | Select-Object Name,RecipientTypeDetails,PrimarySmtpAddress | Format-Table
+        Add-Content -Path $fallbackLog -Value ("{0} | {1} | MULTIPLE MAILBOXES FOUND | Count={2}" -f (Get-Date), $Upn, $mbx.Count)
+        return
+    }
+
+    $id   = $mbx.Guid
+    $name = $mbx.Name
+
+    Write-Host "[$Upn] Resolved to $name ($id), applying attributes..."
+
+    try {
+        Set-Mailbox -Identity $id `
+            -CustomAttribute1 $Ca1 `
+            -CustomAttribute2 $Ca2 `
+            -CustomAttribute3 $Ca3 `
+            -ErrorAction Stop
+
+        # Log fallback success
+        Add-Content -Path $fallbackLog -Value ("{0} | {1} | RESOLVED | Mailbox={2} | GUID={3}" -f (Get-Date), $Upn, $name, $id)
+    }
+    catch {
+        $inner = $_.Exception.Message
+        $full  = $_ | Out-String
+
+        if ($inner -like "*couldn't be found*" -or
+            $inner -like "*cannot find*"      -or
+            $inner -like "*no such object*") {
+
+            Write-Warning "[$Upn] Mailbox disappeared before update."
+            Add-Content -Path $fallbackLog -Value ("{0} | {1} | NO MAILBOX FOUND (Resolve-Ambiguous Set-Mailbox)" -f (Get-Date), $Upn)
+        }
+        else {
+            Write-Warning "[$Upn] Failed to update after resolution: $inner"
+
+            # Log error + full exception details
+            Add-Content -Path $fallbackLog -Value ("{0} | {1} | ERROR (Resolve-Ambiguous Set-Mailbox) | {2}" -f (Get-Date), $Upn, $inner)
+            Add-Content -Path $fallbackLog -Value ("{0} | {1} | EXCEPTION DETAILS | {2}" -f (Get-Date), $Upn, $full)
+        }
+
+        Add-Content -Path $fallbackLog -Value "------------------------------------------------------------"
+    }
+}
+
+# CSV with PANL/Entra mappings
+$rows = Import-Csv -Path $csvPath
+
+# Process each row in CSV
+foreach ($row in $rows) {
+
+    $upn     = $row.UPN.Trim()
+    $empType = ($row.UserType | ForEach-Object { $_.Trim() })
+    $status  = ($row.Status   | ForEach-Object { $_.Trim() })
+    $role    = ($row.Role     | ForEach-Object { $_.Trim() })
+
+    if (-not $upn) {
+        Write-Warning "Row with missing UPN, skipping."
+        continue
+    }
+
+    # CustomAttribute1 (Employee Type)
+    # $empType comes from $row.UserType, which already merged PANL/Entra logic
+    if ([string]::IsNullOrWhiteSpace($empType)) {
+        $ca1 = $null
+    }
+    elseif ($empType -ieq "Employee") {
+        # Only plain "Employee" is normalized to "Staff"
+        $ca1 = "Staff"
+    }
+    else {
+        # Everything else passes through as-is:
+        # "Contractor", "Systems Account", "Service Account", "Shared Mailbox", etc.
+        $ca1 = $empType
+    }
+
+
+    # CustomAttribute2 (Role)
+    if ([string]::IsNullOrWhiteSpace($role)) {
+        $ca2 = $null
+    }
+    else {
+        $ca2 = $role
+    }
+
+    # CustomAttribute3 (Status)
+    if ($status -match '^(?i)active') {
+        $ca3 = "Active"
+    }
+    else {
+        $ca3 = "Terminated"
+    }
+
+    # Log any unexpected inputs (e.g., "test", blank, numeric, etc.)
+    if ($status -notmatch '^(?i)(active|terminated)') {
+        Add-Content -Path $fallbackLog -Value ("{0} | {1} | UNEXPECTED STATUS VALUE: '{2}'" -f (Get-Date), $upn, $status)
+    }
+
+    if ($exoAction -eq 'D') {
+        # DRY RUN: just show what would happen
+        Write-Host "[DRY RUN] Would update $upn -> CA1='$ca1' CA2='$ca2' CA3='$ca3'"
+        continue
+    }
+
+    # Real write to EXO
+    Write-Host "Updating $upn -> CA1='$ca1' CA2='$ca2' CA3='$ca3'"
+
+    try {
+        Set-Mailbox -Identity $upn `
+            -CustomAttribute1 $ca1 `
+            -CustomAttribute2 $ca2 `
+            -CustomAttribute3 $ca3 `
+            -ErrorAction Stop
+    }
+
+    catch {
+        $msg  = $_.Exception.Message
+        $full = $_ | Out-String
+
+        if ($msg -like "*matches multiple entries*") {
+            Resolve-AmbiguousMailboxAndSetAttributes -Upn $upn -Ca1 $ca1 -Ca2 $ca2 -Ca3 $ca3
+        }
+        else {
+            Write-Warning "Failed to update mailbox for $upn : $msg"
+
+            Add-Content -Path $fallbackLog -Value ("{0} | {1} | ERROR (Set-Mailbox) | {2}" -f (Get-Date), $upn, $msg)
+            Add-Content -Path $fallbackLog -Value ("{0} | {1} | EXCEPTION DETAILS | {2}" -f (Get-Date), $upn, $full)
+            Add-Content -Path $fallbackLog -Value "------------------------------------------------------------"
+        }
+    }
+
+}
+
+        # ========================================================
+        # DYNAMIC DISTRIBUTION GROUP (DDL) CREATION SECTION
+        # ========================================================
+
+# Only offer DDL creation if EXO changes were actually applied
+# (Dry Run does NOT allow creation or updates)
+if ($exoAction -eq "Y") {
+
+    Write-Host "`n=== Dynamic Distribution List Creation ===" -ForegroundColor Cyan
+
+    $ddlPromptRaw = Read-Host "Would you like to create or update Dynamic Distribution Lists for this Company/Dept? (Y/N)"
+    $ddlPrompt    = $ddlPromptRaw.Trim().ToUpper()
+
+    if ($ddlPrompt -eq "Y") {
+
+        #
+        # Resolve Company/Dept context for DDL filters
+        #
+
+        $useCompany = -not [string]::IsNullOrWhiteSpace($ddlCompany)
+        $useDept    = $ddlUseDept -and -not [string]::IsNullOrWhiteSpace($ddlDept)
+
+        # If we pulled by Company and auto-detected a Department,
+        # ask whether to INCLUDE Department as a filter (since that can exclude users with blank Dept)
+        if ($matchType -eq "C" -and $useDept) {
+            Write-Host "`nUser list was pulled by Company." -ForegroundColor Yellow
+            Write-Host "A Department value was detected: '$ddlDept'." -ForegroundColor Yellow
+            Write-Host "If you include Department in the DDL filters, users in this Company with a BLANK Department will be excluded." -ForegroundColor Yellow
+
+            $deptChoiceRaw = Read-Host "Do you want to include Department in the DDL filters? (Y = Yes, N = No)"
+            $deptChoice    = $deptChoiceRaw.Trim().ToUpper()
+
+            if ($deptChoice -eq "N") {
+                Write-Host "Department will NOT be used in DDL filters (Company-only filter)." -ForegroundColor DarkYellow
+                $useDept = $false
+            }
+            else {
+                Write-Host "Department will be included in DDL filters." -ForegroundColor Green
+            }
+        }
+
+        # If Company is empty, let the user set or skip
+        if (-not $useCompany) {
+            Write-Host "`nNo Company value is currently set for DDL filters." -ForegroundColor Yellow
+            $inputCompany = Read-Host "Enter a Company name to filter on, or press ENTER to omit Company"
+
+            if ([string]::IsNullOrWhiteSpace($inputCompany)) {
+                $useCompany = $false
+                $ddlCompany = $null
+            } else {
+                $ddlCompany = $inputCompany
+                $useCompany = $true
+            }
+        }
+
+        # If Department is not being used (either missing or you chose not to use it),
+        # still give the option to supply one now.
+        if (-not $useDept) {
+            Write-Host "`nNo Department filter is currently in use." -ForegroundColor Yellow
+            $inputDept = Read-Host "Enter a Department to filter on, or press ENTER to omit Department"
+
+            if ([string]::IsNullOrWhiteSpace($inputDept)) {
+                $useDept = $false
+                $ddlDept = $null
+            } else {
+                $ddlDept = $inputDept
+                $useDept = $true
+            }
+        }
+
+        # Ask for email domain
+        $smtpDomain = Read-Host "`nEnter the email domain for these DDLs (e.g. pansophiclearning.com)"
+        if ([string]::IsNullOrWhiteSpace($smtpDomain)) {
+            Write-Host "No domain entered. Skipping DDL creation." -ForegroundColor Yellow
+            return
+        }
+
+        # Ask for DDL Names
+        Write-Host "`nEnter the names of the DDLs you want to create/update (leave blank to skip each):"
+
+        $ddlNameStaffPlus   = Read-Host "Staff PLUS Contractors (ALL Staff)"
+        $ddlNameEmployees   = Read-Host "Employees ONLY"
+        $ddlNameContractors = Read-Host "Contractors ONLY"
+
+        # Helper to build shared filter
+        function New-DDLFilter {
+            param(
+                [string]$Company,
+                [string]$Dept,
+                [string]$Ca1Filter,
+                [bool]  $UseDept,
+                [bool]  $UseCompany
+            )
+
+            $filter = @()
+            $filter += "(RecipientTypeDetails -eq 'UserMailbox')"
+            $filter += "(CustomAttribute3 -eq 'Active')"
+
+            if ($UseCompany -and $Company) { $filter += "(Company -eq '$Company')" }
+            if ($UseDept -and $Dept)       { $filter += "(Department -eq '$Dept')" }
+
+            switch ($Ca1Filter) {
+                "StaffPlus"      { $filter += "((CustomAttribute1 -eq 'Staff') -or (CustomAttribute1 -eq 'Contractor'))" }
+                "EmployeeOnly"   { $filter += "(CustomAttribute1 -eq 'Staff')" }
+                "ContractorOnly" { $filter += "(CustomAttribute1 -eq 'Contractor')" }
+            }
+
+            $filter += "(DisplayName -notlike 'zZz*')"
+            $filter += "(DisplayName -notlike 'AA - *')"
+
+            return "(" + ($filter -join " -and ") + ")"
+        }
+
+        #
+        # Helper — Create *OR* Update a DDL
+        #
+        function New-Update-DDL {
+            param(
+                [string]$Name,
+                [string]$Ca1Filter
+            )
+
+            $filter = New-DDLFilter -Company $ddlCompany -Dept $ddlDept -Ca1Filter $Ca1Filter -UseDept $useDept -UseCompany $useCompany
+            $smtp = "$Name@$smtpDomain"
+
+            # Check if DDL exists
+            $existing = Get-DynamicDistributionGroup -Identity $Name -ErrorAction SilentlyContinue
+
+            if ($existing) {
+                Write-Warning "DDL '$Name' already exists."
+
+                $choice = Read-Host "Would you like to UPDATE the existing DDL instead? (Y/N)"
+                $choice = $choice.Trim().ToUpper()
+
+                if ($choice -eq "Y") {
+                    Write-Host "Updating DDL '$Name'..." -ForegroundColor Yellow
+                    Set-DynamicDistributionGroup -Identity $Name -RecipientFilter $filter
+                } else {
+                    Write-Host "Skipping update for '$Name'." -ForegroundColor DarkYellow
+                }
+            }
+            else {
+                Write-Host "Creating DDL '$Name'..." -ForegroundColor Green
+                New-DynamicDistributionGroup -Name $Name -PrimarySmtpAddress $smtp -RecipientFilter $filter
+            }
+        }
+
+        #
+        # PROCESS EACH DDL CHOICE
+        #
+        if ($ddlNameStaffPlus)   { New-Update-DDL -Name $ddlNameStaffPlus   -Ca1Filter "StaffPlus" }
+        if ($ddlNameEmployees)   { New-Update-DDL -Name $ddlNameEmployees   -Ca1Filter "EmployeeOnly" }
+        if ($ddlNameContractors) { New-Update-DDL -Name $ddlNameContractors -Ca1Filter "ContractorOnly" }
+
+    } else {
+        Write-Host "Skipping DDL creation." -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host "DDL creation skipped because EXO writeback was a Dry Run." -ForegroundColor DarkGray
+}
+
+        # ==============================================
+        # OPTIONAL: EXPORT MEMBERSHIP FOR CREATED DDLs
+        # ==============================================
+    if ($exoAction -eq "Y") {
+        $exportMembersRaw = Read-Host "`nWould you like to export the membership for the created DDLs? (Y/N)"
+        $exportMembers    = $exportMembersRaw.Trim().ToUpper()
+
+        if ($exportMembers -eq "Y") {
+
+            Write-Host "`nExporting DDL memberships...`n" -ForegroundColor Cyan
+
+            function Export-DDLMembers {
+                param([string]$Name)
+
+                try {
+                    $ddl = Get-DynamicDistributionGroup -Identity $Name -ErrorAction Stop
+
+                    $members = Get-Recipient -RecipientPreviewFilter $ddl.RecipientFilter -ResultSize Unlimited |
+                        Select-Object DisplayName,PrimarySmtpAddress,Company,Department,RecipientTypeDetails
+
+                    $path = "C:\ScriptReturns\$Name-members.csv"
+                    $members | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+
+                    Write-Host "Exported membership for '$Name' to $path" -ForegroundColor Green
+                }
+                catch {
+                    Write-Warning "Failed to export membership for $Name : $($_.Exception.Message)"
+                }
+            }
+
+            if ($ddlNameStaffPlus)   { Export-DDLMembers -Name $ddlNameStaffPlus }
+            if ($ddlNameEmployees)   { Export-DDLMembers -Name $ddlNameEmployees }
+            if ($ddlNameContractors) { Export-DDLMembers -Name $ddlNameContractors }
+
+            Write-Host "`nDDL Membership exports complete.`n" -ForegroundColor Green
+        }
+        else {
+            Write-Host "Skipping DDL membership export." -ForegroundColor Yellow
+        }
+    }
