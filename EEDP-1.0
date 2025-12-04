@@ -540,12 +540,19 @@ if ($exoAction -eq "Y") {
                 [bool]  $UseCompany
             )
 
+            # Escape apostrophes for OPATH (single quotes inside single-quoted strings)
+            $safeCompany = $Company
+            $safeDept    = $Dept
+
+            if ($safeCompany) { $safeCompany = $safeCompany -replace "'", "''" }
+            if ($safeDept)    { $safeDept    = $safeDept    -replace "'", "''" }
+
             $filter = @()
             $filter += "(RecipientTypeDetails -eq 'UserMailbox')"
             $filter += "(CustomAttribute3 -eq 'Active')"
 
-            if ($UseCompany -and $Company) { $filter += "(Company -eq '$Company')" }
-            if ($UseDept -and $Dept)       { $filter += "(Department -eq '$Dept')" }
+            if ($UseCompany -and $safeCompany) { $filter += "(Company -eq '$safeCompany')" }
+            if ($UseDept    -and $safeDept)    { $filter += "(Department -eq '$safeDept')" }
 
             switch ($Ca1Filter) {
                 "StaffPlus"      { $filter += "((CustomAttribute1 -eq 'Staff') -or (CustomAttribute1 -eq 'Contractor'))" }
@@ -569,7 +576,11 @@ if ($exoAction -eq "Y") {
             )
 
             $filter = New-DDLFilter -Company $ddlCompany -Dept $ddlDept -Ca1Filter $Ca1Filter -UseDept $useDept -UseCompany $useCompany
-            $smtp = "$Name@$smtpDomain"
+            $smtp   = "$Name@$smtpDomain"
+
+            # DEBUG: Show the final OPATH filter used
+            Write-Host "`n[DEBUG] RecipientFilter for '$Name':" -ForegroundColor DarkGray
+            Write-Host $filter -ForegroundColor DarkGray
 
             # Check if DDL exists
             $existing = Get-DynamicDistributionGroup -Identity $Name -ErrorAction SilentlyContinue
